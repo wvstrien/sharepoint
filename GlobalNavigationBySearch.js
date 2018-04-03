@@ -5,6 +5,7 @@ wvstrienCustomGlobalNav.Models.NavigationNode = function () {
     this.Url = ko.observable("");
     this.Title = ko.observable("");
     this.Parent = ko.observable("");
+    this.IsHidden =  ko.observable(false);
 };
 
 wvstrienCustomGlobalNav.ViewModel = function () {
@@ -63,6 +64,7 @@ wvstrienCustomGlobalNav.ViewModel = function () {
             item.Title(dto.Title);
             item.Url(dto.Url);
             item.Parent(dto.Parent);
+            item.IsHidden(dto.IsHidden);
         }
 
         return item;
@@ -90,7 +92,7 @@ wvstrienCustomGlobalNav.ViewModel = function () {
             root = _spPageContextInfo.siteAbsoluteUrl;
             userAndSiteKeyId = _spPageContextInfo.siteId + "_" + _spPageContextInfo.userLoginName + "_";
         } else {
-           root = document.location.href.match(/https\:\/\/wvstrien.sharepoint.com\/.[^\/]+\/.[^\/]+\//)[0];
+           root = document.location.href.match(/https\:\/\/.[^\/]+\/.[^\/]+\/.[^\/]+\//)[0];
            root = root.substring(0, root.length - 1);
            userAndSiteKeyId = root + "_";
         }
@@ -121,6 +123,7 @@ wvstrienCustomGlobalNav.ViewModel = function () {
                             });
 
                             self.buildHierarchy(cacheResults);
+                            self.removeHiddenFromHierarchy(self.hierarchy()[0], null);
                             self.toggleView();
                             addEventsToElements();
                             return;
@@ -132,8 +135,41 @@ wvstrienCustomGlobalNav.ViewModel = function () {
             self.queryRemoteInterface();
         };
 
-        //Executes a REST call and builds the navigation hierarchy.
-        self.queryRemoteInterface = function () {
+        self.queryRemoteInterface = function () {            
+             Promise.all([
+                 self.getGlobalNavigationViaSearch(),
+                 self.getAdditionalGlobalNavigationLinks(),
+                 self.getHiddenGlobalNavigationLinks()]
+             ).then(
+                function(asyncValues) {
+                    var resultsSearch = asyncValues[0];
+                    var resultSearchAdditional = asyncValues[1];
+                    var resultsSearchHidden = asyncValues[2];
+                    var results = resultsSearch.concat(resultSearchAdditional);
+
+                    var tenantUrl = root.match(/https\:\/\/.[^\/]+\//)[0].toLowerCase();
+                    tenantUrl = tenantUrl.substr(0, tenantUrl.length - 1);
+
+                    $(resultsSearchHidden).each(function(i, item) {
+                        if (item.IsHidden) {
+                            var itemUrl = item.SimpleUrl;
+                            var fullMenuUrl = tenantUrl + itemUrl.toLowerCase();
+                            for (var i = 0; i < results.length; i++) {
+                                if (results[i].Url().toLowerCase() === fullMenuUrl) {
+                                    results[i].IsHidden(true);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
+                    self.cacheAndDisplayQueriedResults(results); 
+                }
+             );
+        };
+
+        self.getGlobalNavigationViaSearch = function() {
+          return new Promise(function (resolve, reject) {
             var oDataRequest = getRequest(query);
             $.ajax(oDataRequest).done(function (data) {
                 var results = [];
@@ -151,16 +187,18 @@ wvstrienCustomGlobalNav.ViewModel = function () {
                     var navItem = getNavigationFromDto(item);
                     if (navItem != null) results.push(navItem);
                 });
-
-                self.additionalGlobalNavigationLinks(results);
+                resolve(results);
             }).fail(function () {
                 //Handle error here!!
                 $("#loading").hide();
                 $("#error").show();
+                reject([]);
             });
+          })
         };
 
-        self.additionalGlobalNavigationLinks = function (results) {
+        self.getAdditionalGlobalNavigationLinks = function () {
+          return new Promise(function (resolve, reject) {
             var listAdditionalLinks = "AdditionalGlobalNavigationLinks";
             var checkListExists = root + "/_api/Web/Lists?$filter=title eq '" + listAdditionalLinks  + "'";
             var checkRequest = getRequest(checkListExists);
@@ -169,6 +207,7 @@ wvstrienCustomGlobalNav.ViewModel = function () {
                     var getAddionalLinksRequest = root + "/_api/web/lists/getbytitle('" + listAdditionalLinks + "')/items"
                     var getNavLinksRequest = getRequest(getAddionalLinksRequest);
                     $.ajax(getNavLinksRequest).done(function (data) {
+                        var results = [];
                         $(data.d.results).each(function(i, item) {
                             if (item.Url != null) {
                                 var navItem = new wvstrienCustomGlobalNav.Models.NavigationNode();
@@ -179,16 +218,31 @@ wvstrienCustomGlobalNav.ViewModel = function () {
                             }
                         });
 
-                        self.cacheAndDisplayQueriedResults(results);
-
+                        resolve(results);
                     }).fail(function () {
-                        self.cacheAndDisplayQueriedResults(results);
+                        resolve([]);
                     });
-
                 } else {
-                    self.cacheAndDisplayQueriedResults(results);
+                    resolve([]);
                 }
             });
+          });
+        };
+
+        self.getHiddenGlobalNavigationLinks = function () {
+          return new Promise(function (resolve, reject) {
+            var globalMapProviderUrl = root + "/_api/navigation/menustate?mapprovidername=\'GlobalNavigationSwitchableProvider\'";
+            var globalMapProviderRequest = getRequest(globalMapProviderUrl);
+            $.ajax(globalMapProviderRequest).done(function (data) {
+                 var results = [];
+                 if (data.d && data.d.MenuState && data.d.MenuState.Nodes) {
+                     results = data.d.MenuState.Nodes.results;
+                 }
+                 resolve(results);
+             }).fail(function () {
+                 resolve([]);
+             });
+          });
         };
 
         self.cacheAndDisplayQueriedResults = function (results) {
@@ -202,6 +256,7 @@ wvstrienCustomGlobalNav.ViewModel = function () {
                 var sortedArray = unsortedArray.sort(self.sortObjectsInArray);
 
                 self.buildHierarchy(sortedArray);
+                self.removeHiddenFromHierarchy(self.hierarchy()[0], null);
                 self.toggleView();
                 addEventsToElements();
 
@@ -214,7 +269,7 @@ wvstrienCustomGlobalNav.ViewModel = function () {
             var currentWeb = clientcontext.get_web();
             clientcontext.load(currentWeb, 'Title');
             clientcontext.executeQueryAsync(
-            function () {
+                function () {
                     $.each(self.nodes(), function (i, item) {
                         if (item.Title() == "Root") {
                             item.Title(currentWeb.get_title());
@@ -303,15 +358,27 @@ wvstrienCustomGlobalNav.ViewModel = function () {
         self.sortObjectsInArray2 = function (a, b) {
             return (self.sortObjectsInArray(a.item, b.item) * -1);
         };
+
+        self.removeHiddenFromHierarchy = function(node, parentNode) {
+            if (parentNode && parentNode.children && node.item.IsHidden()) {
+                parentNode.children = parentNode.children.filter(function(el) { return el !== node; });
+            } else {
+                if (node.children && node.children.length > 0) {
+                    for (var i = node.children.length - 1; i>= 0; i--) {
+                        self.removeHiddenFromHierarchy(node.children[i], node);
+                    }
+                }
+            }
+        }
     }
 
     //Loads the navigation on load and binds the event handlers for mouse interaction.
-    function ContinueOnceJqueryAndKoLoaded() {
-        if (window.jQuery && window.ko) {
+    function ContinueOnceAllDependentLibsLoaded() {
+        if (window.jQuery && window.ko && window.Promise) {
             var viewModel = new NavigationViewModel();
             viewModel.loadNavigatioNodes();
         } else {
-            window.setTimeout(ContinueOnceJqueryAndKoLoaded, 100);
+            window.setTimeout(ContinueOnceAllDependentLibsLoaded, 100);
         }
     }
 
@@ -326,8 +393,12 @@ wvstrienCustomGlobalNav.ViewModel = function () {
             script.src = "//ajax.aspnetcdn.com/ajax/knockout/knockout-2.2.0.js";
             document.head.appendChild(script);
         }
-
-        ContinueOnceJqueryAndKoLoaded();
+        if (!window.Promise) {
+            var script = document.createElement("script");
+            script.src = "//cdnjs.cloudflare.com/ajax/libs/bluebird/3.3.4/bluebird.min.js";
+            document.head.appendChild(script);
+        }
+        ContinueOnceAllDependentLibsLoaded();
     }
 
     function addEventsToElements() {
