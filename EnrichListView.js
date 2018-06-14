@@ -62,24 +62,37 @@ EnrichListView.ViewModel = function () {
                 }
             });
 
-            // Declare the body of table as the 'island' to be subject for filtering
-            $table.find("tbody").addClass("list");
-
-            if (viewMode.toLowerCase() === "gridview") {
-                $('<thead></thead>').insertBefore($table.children("tbody"));
-                $header.detach();
-                $header.appendTo($table.children("thead"));
-            }
-
-            var filterList = new List($table.attr("id"), { valueNames: valueNames, page: 2000 });
-
-            // Standard 'List' behavior hides all rows not matching the filter. In case of gridview, this is undesired for the last row, which is used to
-            // potential add new entries.
-            if (viewMode.toLowerCase() === "gridview") {
-                filterList.on("searchComplete", function() {
-                    var $lastTr = $(IdentifyingClassListView()).find(".list").children("tr").last();
-                    $lastTr.show();                                    
+            if ($table.find("tbody[groupstring]").length > 0) {
+                // In case of grouped listview; the table contains multiple tbody elements. Each must individual by connected to a List element
+                var tbodySeq = 0;
+ 	        $table.children("tbody[isLoaded]").each(function() {
+                    if ($(this).find("td").length > 0) {
+                        var uniqueClass = "list_" + tbodySeq;
+                        $(this).addClass(uniqueClass );
+                        var filterList = new List($table.attr("id"), { valueNames: valueNames, listClass: uniqueClass, page: 2000 }); 
+                    }
+                    tbodySeq = tbodySeq + 1;          
                 });
+            } else {
+                if (viewMode.toLowerCase() === "gridview") {
+                    $('<thead></thead>').insertBefore($table.children("tbody"));
+                    $header.detach();
+                    $header.appendTo($table.children("thead"));
+                }
+            
+                // Declare the body of table as the 'island' to be subject for filtering
+                $table.find("tbody").addClass("list");
+
+                var filterList = new List($table.attr("id"), { valueNames: valueNames, page: 2000 });
+
+                // Standard 'List' behavior hides all rows not matching the filter. In case of gridview, this is undesired for the last row, which is used to
+                // potential add new entries.
+                if (viewMode.toLowerCase() === "gridview") {
+                    filterList.on("searchComplete", function() {
+                        var $lastTr = $(IdentifyingClassListView()).find(".list").children("tr").last();
+                        $lastTr.show();                                    
+                    });
+                }
             }
         }
     }
@@ -97,7 +110,28 @@ EnrichListView.ViewModel = function () {
                 // (sort, filter on a value)
                 ExecuteOrDelayUntilScriptLoaded(OverloadPostRenderAfterJSGridRender, "inplview.js");
             } else {
-                ExecuteOrDelayUntilScriptLoaded(OverloadReRenderListView, "inplview.js");
+                // If no grouping, ReRenderListView called. Otherwise, the rendering is done per tbody element via clienttemplates rendering.
+                if ($table.find("tbody[groupstring]").length == 0) {   
+                    ExecuteOrDelayUntilScriptLoaded(OverloadReRenderListView, "inplview.js");
+                } else {
+                    var viewId = "{" + $table.attr("view") + "}";
+                    var viewCounter = window["ctx" + g_ViewIdToViewCounterMap[viewId]];
+                    SPClientRenderer.AddPostRenderCallback(viewCounter, function() { 
+                         EnrichListView.ViewModel.AddDynamicFilteringToListView();
+                         var $table = $(EnrichListView.ViewModel.IdentifyingClassListView());
+                         var $nonEmptyFilters = $table.find(".search").filter(function () { return this.value.length > 0 });
+                         if ($nonEmptyFilters.length > 0) {
+                             var evt;
+                             try {
+                                 evt = new KeyboardEvent("keyup");
+                             } catch (e) {
+                                 evt = document.createEvent('KeyboardEvent');
+                                 evt.initEvent('keyup', true, false);
+                             }
+                             $nonEmptyFilters[0].dispatchEvent(evt);
+                         }
+                    });
+                }
             }
         } else {
             window.setTimeout(ContinueOnceAllDataLoaded, 100);
