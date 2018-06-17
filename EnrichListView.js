@@ -1,16 +1,6 @@
 
 // Overload inplview.js functions, to restore dynamic filtering after navigating to another view (paging, sorting, ...)
 
-function OverloadPostRenderAfterJSGridRender() {
-    if ($.prototype.GridView_base__PostRenderAfterJSGridRender === undefined) {
-        $.prototype.GridView_base__PostRenderAfterJSGridRender = PostRenderAfterJSGridRender;
-        PostRenderAfterJSGridRender = function (a) {
-           $.prototype.GridView_base__PostRenderAfterJSGridRender(a);
-           EnrichListView.ViewModel.AddDynamicFilteringToListView();
-       }
-    }
-}
-
 function OverloadReRenderListView() {
     if ($.prototype.GridView_base__ReRenderListView === undefined) {
         $.prototype.GridView_base__ReRenderListView = ReRenderListView;
@@ -27,6 +17,7 @@ var EnrichListView = EnrichListView || {};
 EnrichListView.ViewModel = function () {
 
     function AddDynamicFilteringToListView() {
+        viewMode = $(".ms-listviewgrid").length === 1 ? "gridview" : "listview";
 
         var $table = $(IdentifyingClassListView());
 
@@ -99,39 +90,35 @@ EnrichListView.ViewModel = function () {
 
     //Loads the navigation on load and binds the event handlers for mouse interaction.
     function ContinueOnceAllDataLoaded() {
+        viewMode = $(".ms-listviewgrid").length === 1 ? "gridview" : "listview";
+
         var $table = $(IdentifyingClassListView());
         if ($table.length === 1) {
             // Race-condition: can be that gridview is already rendered on first page-load; therefore add explicit.
             // For re-render scenarios; handled by adding to the inplview.js handling
             AddDynamicFilteringToListView();
 
-            if (viewMode.toLowerCase() === "gridview") {
-                // Overload PostRender function to re-apply adding dynamic filtering in case of user-initiated modifications of grid via menu 
-                // (sort, filter on a value)
-                ExecuteOrDelayUntilScriptLoaded(OverloadPostRenderAfterJSGridRender, "inplview.js");
+            // If no grouping, ReRenderListView called. Otherwise, the rendering is done per tbody element via clienttemplates rendering.
+            if ($table.find("tbody[groupstring]").length == 0) {   
+                ExecuteOrDelayUntilScriptLoaded(OverloadReRenderListView, "inplview.js");
             } else {
-                // If no grouping, ReRenderListView called. Otherwise, the rendering is done per tbody element via clienttemplates rendering.
-                if ($table.find("tbody[groupstring]").length == 0) {   
-                    ExecuteOrDelayUntilScriptLoaded(OverloadReRenderListView, "inplview.js");
-                } else {
-                    var viewId = "{" + $table.attr("view") + "}";
-                    var viewCounter = window["ctx" + g_ViewIdToViewCounterMap[viewId]];
-                    SPClientRenderer.AddPostRenderCallback(viewCounter, function() { 
-                         EnrichListView.ViewModel.AddDynamicFilteringToListView();
-                         var $table = $(EnrichListView.ViewModel.IdentifyingClassListView());
-                         var $nonEmptyFilters = $table.find(".search").filter(function () { return this.value.length > 0 });
-                         if ($nonEmptyFilters.length > 0) {
-                             var evt;
-                             try {
-                                 evt = new KeyboardEvent("keyup");
-                             } catch (e) {
-                                 evt = document.createEvent('KeyboardEvent');
-                                 evt.initEvent('keyup', true, false);
-                             }
-                             $nonEmptyFilters[0].dispatchEvent(evt);
-                         }
-                    });
-                }
+                var viewId = "{" + $table.attr("view") + "}";
+                var viewCounter = window["ctx" + g_ViewIdToViewCounterMap[viewId]];
+                SPClientRenderer.AddPostRenderCallback(viewCounter, function() { 
+                    EnrichListView.ViewModel.AddDynamicFilteringToListView();
+                    var $table = $(EnrichListView.ViewModel.IdentifyingClassListView());
+                    var $nonEmptyFilters = $table.find(".search").filter(function () { return this.value.length > 0 });
+                    if ($nonEmptyFilters.length > 0) {
+                        var evt;
+                        try {
+                            evt = new KeyboardEvent("keyup");
+                        } catch (e) {
+                            evt = document.createEvent('KeyboardEvent');
+                            evt.initEvent('keyup', true, false);
+                        }
+                        $nonEmptyFilters[0].dispatchEvent(evt);
+                    }
+                });
             }
         } else {
             window.setTimeout(ContinueOnceAllDataLoaded, 100);
@@ -155,7 +142,7 @@ EnrichListView.ViewModel = function () {
         }
         if (typeof(List) == 'undefined') {
             var script = document.createElement("script");
-            script.src = "//<personal-CDN>/CustomizeListView/List.js";
+            script.src = "//<personal-CDN>/CustomizeListView/List.min.js";
             document.head.appendChild(script);
         }
 
@@ -164,9 +151,6 @@ EnrichListView.ViewModel = function () {
 
     // Default ListView
     var viewMode = "ListView";
-    function SetViewMode(mode) {
-        viewMode = mode;
-    }
 
     function IdentifyingClassListView() {
         if (viewMode.toLowerCase() === "gridview") {
@@ -181,7 +165,6 @@ EnrichListView.ViewModel = function () {
     return {
         InitEnrichment: InitEnrichment,
         AddDynamicFilteringToListView: AddDynamicFilteringToListView,
-        SetViewMode: SetViewMode,
         IdentifyingClassListView: IdentifyingClassListView
     }
 } ();

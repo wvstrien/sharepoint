@@ -990,6 +990,9 @@ module.exports = function(list) {
             }
             searchStrings[id] = s;
         },
+        getSearchStrings: function() {
+            return searchStrings;
+        },
         
         toArray: function(values) {
             var tmpColumn = [];
@@ -1030,34 +1033,35 @@ module.exports = function(list) {
     };
 
     var searchMethod = function(str, column) {
-        list.trigger('searchStart');
+        if (prepare.getSearchStrings() === undefined || prepare.getSearchStrings()[column] != str) {
+            list.trigger('searchStart');
 
-        prepare.resetList();
+            prepare.resetList();
         
-        prepare.setSearchStrings(str, column);
+            prepare.setSearchStrings(str, column);
         
-        prepare.setOptions(arguments); // str, cols|searchFunction, searchFunction
-        prepare.setColumns();
+            prepare.setOptions(arguments); // str, cols|searchFunction, searchFunction
+            prepare.setColumns();
 
-		var searchSpec = "";
-		for (var name in list.items[0].values())
-		{
-			searchSpec += searchStrings[name];
-		}
-        if (searchSpec === "" ) {
-            search.reset();
-        } else {
-            list.searched = true;
-            if (customSearch) {
-                customSearch(searchStrings, columns);
+            var searchSpec = "";
+	    for (var name in list.items[0].values())
+	    {
+		searchSpec += searchStrings[name];
+	    }
+            if (searchSpec === "" ) {
+                search.reset();
             } else {
-                search.list();
+                list.searched = true;
+                if (customSearch) {
+                    customSearch(searchStrings, columns);
+                } else {
+                    search.list();
+                }
             }
-        }
 
-        list.update();
-        list.trigger('searchComplete');
-      
+            list.update();
+            list.trigger('searchComplete');
+        }      
         return list.visibleItems;
     };
 
@@ -1070,6 +1074,12 @@ module.exports = function(list) {
         if (!alreadyCleared) { // If oninput already have resetted the list, do nothing
             searchMethod(target.value, target.id);
         }
+
+        // Make sure that on re-enter in an input field; the focus is maintained and pointer at end
+        target.focus();
+        var val = target.value;
+        target.value = '';
+        target.value = val;
     });
 
     // Used to detect click on HTML5 clear button
