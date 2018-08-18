@@ -1,0 +1,36 @@
+using System.Net;
+
+public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceWriter log)
+{
+    string origin = null;    
+    var originHeader = req.Headers.Where(header => header.Key == "Origin").FirstOrDefault().Value;
+    if (originHeader != null) {
+        origin = originHeader.FirstOrDefault();
+    }
+
+    if (req.Method == HttpMethod.Options) {
+        HttpResponseMessage response = req.CreateResponse(HttpStatusCode.OK);
+        return EnrichResponseWithCORS(origin, response);
+    } else if (req.Method == HttpMethod.Get) {
+        using (var client = new HttpClient())
+        {
+            client.DefaultRequestHeaders.Authorization = req.Headers.Authorization;
+            client.DefaultRequestHeaders.Add("X-IDCRL_ACCEPTED", "t");
+
+            var response = await client.GetAsync("https://asml.sharepoint.com/_vti_bin/idcrl.svc/");
+            return EnrichResponseWithCORS(origin, response);
+        }
+    } else {
+        return req.CreateResponse(HttpStatusCode.BadRequest, "Unsupported Method");
+    }
+}
+
+private static HttpResponseMessage EnrichResponseWithCORS(string origin, HttpResponseMessage response) {
+    if (!string.IsNullOrEmpty(origin)) {   
+        response.Headers.Add("Access-Control-Allow-Origin", origin);
+        response.Headers.Add("Access-Control-Allow-Methods", "GET,OPTIONS");
+        response.Headers.Add("Access-Control-Allow-credentials", "true");
+        response.Headers.Add("Access-Control-Allow-Headers", "content-type,authorization,x-idcrl_accepted");
+    }
+    return response;
+}
