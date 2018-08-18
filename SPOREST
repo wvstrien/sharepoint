@@ -1,0 +1,146 @@
+using System.Net;
+
+public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceWriter log)
+{
+    log.Info("C# HTTP trigger function processed a request.");
+
+    log.Info("Request: " + req.ToString());
+
+    string origin = null;
+    var originHeader = req.Headers.Where(header => header.Key == "Origin").FirstOrDefault().Value;
+    if (originHeader != null) {
+        origin = originHeader.FirstOrDefault();
+    }
+
+    if (req.Method == HttpMethod.Options) {
+        HttpResponseMessage response = req.CreateResponse(HttpStatusCode.OK);
+        return EnrichResponseWithCORS(origin, response);
+    } else {
+        string proxiedUrl = req.GetQueryNameValuePairs()
+            .FirstOrDefault(q => string.Compare(q.Key, "url", true) == 0)
+            .Value;
+
+        if (proxiedUrl == null) {
+            return EnrichResponseWithCORS(origin, req.CreateResponse(HttpStatusCode.BadRequest, "Please pass a URL on the query string"));
+        }
+
+        string requestContent = await req.Content.ReadAsStringAsync();
+
+        log.Info("Proxied Url-ish = " + proxiedUrl);
+        log.Info("requestContent = " + requestContent);
+
+        HttpRequestMessage request = new HttpRequestMessage
+        {
+            Method = req.Method,
+            RequestUri = new Uri(proxiedUrl)
+        };
+
+        log.Info("Duplicate the header to proxied request:");
+        foreach (var header in req.Headers) {
+            string headerName = header.Key;
+            switch (headerName) {
+                // Ignore the the headers that cannot be explit set an a request message.
+                case "Accept" :
+                case "AcceptCharset" :
+                case "AcceptEncoding" :
+                case "AcceptLanguage" :
+                case "Connection" :
+                case "ConnectionClose" :
+                case "Expect" :
+                case "IfMatch" :
+                case "IfNoneMatch" :
+                    break;
+
+                // Do not set 'Origin'; CORS is handled in this function itself.
+                case "Origin" :
+                    break;
+                // Cookie must be set via specific handling on send request; done further on.
+                case "Cookie" :
+                    break;
+
+                // For the headers that have a special setter; use that.
+                case "Authorization" :
+                    request.Headers.Authorization = req.Headers.Authorization;
+                    break;
+                case "CacheControl" :
+                    request.Headers.CacheControl = req.Headers.CacheControl;
+                    break;
+                case "Date" :
+                    request.Headers.Date = req.Headers.Date;
+                    break;
+                case "ExpectContinue" :
+                    request.Headers.ExpectContinue = req.Headers.ExpectContinue;
+                    break;
+                case "From" :
+                    request.Headers.From = req.Headers.From;
+                    break;
+                case "HostUIT" :
+                    request.Headers.Host = req.Headers.Host;
+                    break;
+                case "IfModifiedSince" :
+                    request.Headers.IfModifiedSince = req.Headers.IfModifiedSince;
+                    break;
+                case "Max-Forwards" :
+                    request.Headers.MaxForwards = req.Headers.MaxForwards;
+                    break;
+
+                // For the remaining headers; for now just log them.
+                default:
+                    foreach(string value in header.Value) {
+                    //    log.Info(headerName + " :: " + value);   
+                         //    request.Headers.Add(headerName, value);    
+                        
+                    }
+                    break;
+            }
+        }
+
+        if (req.Method != HttpMethod.Get) {
+       // ToDo: derive Content-Type + CharCode from request; see https://docs.microsoft.com/en-us/dotnet/api/system.net.http.headers.httpheaders?view=netframework-4.7.2
+       //     req.Content = new StringContent(requestContent, 
+            req.Content = request.Content;
+        }  
+
+        log.Info("Proxied Request: " + request.ToString());
+        
+        var cookieContainer = new CookieContainer();
+        using (var handler = new HttpClientHandler() { CookieContainer = cookieContainer })
+        using (var client = new HttpClient(handler))
+        {
+            foreach (var acceptMediaType in req.Headers.Accept) {
+                client.DefaultRequestHeaders.Accept.Add(acceptMediaType);
+            }
+
+            var baseAdd = request.RequestUri.GetLeftPart(System.UriPartial.Authority);
+            log.Info("base Address for cookie: " + baseAdd);
+            var baseAddress = new Uri(baseAdd);
+
+            var cookie = req.Headers.GetCookies("SPOIDCRL")?.FirstOrDefault();
+            string cookieString = "";
+            if (cookie != null && !string.IsNullOrEmpty(cookie["SPOIDCRL"].Value)) {
+                // Parsed cookie has '+' replaced by space, en left away the closing '=='
+                cookieString = cookie["SPOIDCRL"].Value.ToString().Replace(" ", "+") + "==";
+                log.Info("Parsed + Propagated as SPOIDCRL cookie: " + cookieString);
+                cookieContainer.Add(baseAddress, new Cookie("SPOIDCRL", cookieString));
+            } else {
+                log.Info("Cookie SPOIDCRL missing in request");                
+            }
+ 
+            HttpResponseMessage response = await client.SendAsync(request);            
+            log.Info("Response code = " + response.StatusCode);
+
+         response.Headers.Add("The-derived-SPOIDCRL-cookie", cookieString);
+            return EnrichResponseWithCORS(origin, response);             
+        }         
+    }
+}
+
+private static HttpResponseMessage EnrichResponseWithCORS(string origin, HttpResponseMessage response) {
+    if (!string.IsNullOrEmpty(origin)) {
+        response.Headers.Add("Access-Control-Allow-Origin", origin);
+        response.Headers.Add("Access-Control-Allow-Methods", "GET,OPTIONS");
+        response.Headers.Add("Access-Control-Allow-credentials", "true");
+        response.Headers.Add("Access-Control-Allow-Headers", "content-type,authorization,x-idcrl_accepted");
+    }
+    return response;
+}
