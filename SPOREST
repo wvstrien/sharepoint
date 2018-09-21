@@ -23,11 +23,13 @@ public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceW
         if (proxiedUrl == null) {
             return EnrichResponseWithCORS(origin, req.CreateResponse(HttpStatusCode.BadRequest, "Please pass a URL on the query string"));
         }
-
-        string requestContent = await req.Content.ReadAsStringAsync();
-
         log.Info("Proxied Url-ish = " + proxiedUrl);
-        log.Info("requestContent = " + requestContent);
+
+        string requestContent = "";
+        if (req.Method == HttpMethod.Post || req.Method == HttpMethod.Put) {
+            requestContent = await req.Content.ReadAsStringAsync();
+            log.Info("requestContent = " + requestContent);
+        }
 
         HttpRequestMessage request = new HttpRequestMessage
         {
@@ -83,22 +85,31 @@ public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceW
                 case "Max-Forwards" :
                     request.Headers.MaxForwards = req.Headers.MaxForwards;
                     break;
+                // Content-Type must be set via specific handling on content.
+                case "Content-Type" :
+                    break;
+                case "X-RequestDigest" :
+                    foreach(string value in header.Value) {
+                        log.Info(headerName + " :: " + value);   
+                             request.Headers.Add(headerName, value);    
+                        
+                    }
+                    break;
 
                 // For the remaining headers; for now just log them.
                 default:
                     foreach(string value in header.Value) {
                     //    log.Info(headerName + " :: " + value);   
-                         //    request.Headers.Add(headerName, value);    
-                        
+                         //    request.Headers.Add(headerName, value);                  
                     }
                     break;
             }
         }
 
-        if (req.Method != HttpMethod.Get) {
-       // ToDo: derive Content-Type + CharCode from request; see https://docs.microsoft.com/en-us/dotnet/api/system.net.http.headers.httpheaders?view=netframework-4.7.2
-       //     req.Content = new StringContent(requestContent, 
-            req.Content = request.Content;
+        if (req.Method == HttpMethod.Post || req.Method == HttpMethod.Put) {
+            request.Content = new StringContent(requestContent, System.Text.Encoding.UTF8, "application/json");
+            request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+            request.Content.Headers.ContentType.Parameters.Add(new System.Net.Http.Headers.NameValueHeaderValue("odata", "verbose"));
         }  
 
         log.Info("Proxied Request: " + request.ToString());
@@ -126,10 +137,9 @@ public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceW
                 log.Info("Cookie SPOIDCRL missing in request");                
             }
  
-            HttpResponseMessage response = await client.SendAsync(request);            
-            log.Info("Response code = " + response.StatusCode);
+            HttpResponseMessage response = await client.SendAsync(request);
 
-         response.Headers.Add("The-derived-SPOIDCRL-cookie", cookieString);
+            log.Info("Response code = " + response.StatusCode);
             return EnrichResponseWithCORS(origin, response);             
         }         
     }
@@ -138,9 +148,9 @@ public static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceW
 private static HttpResponseMessage EnrichResponseWithCORS(string origin, HttpResponseMessage response) {
     if (!string.IsNullOrEmpty(origin)) {
         response.Headers.Add("Access-Control-Allow-Origin", origin);
-        response.Headers.Add("Access-Control-Allow-Methods", "GET,OPTIONS");
+        response.Headers.Add("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,MERGE,OPTIONS");
         response.Headers.Add("Access-Control-Allow-credentials", "true");
-        response.Headers.Add("Access-Control-Allow-Headers", "content-type,authorization,x-idcrl_accepted");
+        response.Headers.Add("Access-Control-Allow-Headers", "content-type,authorization,x-idcrl_accepted,x-requestdigest");
     }
     return response;
 }
