@@ -1,0 +1,864 @@
+#################################################################
+# create a security overview per sitecollection
+#
+###################################################################
+#
+# Impression of the full Process execution:
+#
+# Process-SiteCollection($siteurl, $spoCreds, $siteProcessState){
+#	   Process-Webs $rootweb $rootweb.URL $true 
+#
+# }
+#
+# Function Process-Webs($web, $webUrl, [Boolean] $isroot)
+# {
+#      Report-SiteSecurity  ($web , [Boolean] $isroot)
+#
+#      $allwebs = $web.Webs;
+#      foreach ($subwebUrl in $allwebsUrls)
+#      {	
+#  		  Process-Webs $null $subwebUrl $false  }				
+#     }
+# }
+#
+###################################################################
+#set variables
+
+param (
+    [Parameter(Mandatory=$false)][string]$tenantUrl,
+    [Parameter(Mandatory=$false)][string]$siteUrl,
+	[Parameter(Mandatory=$false)][string]$processingMode="Full",
+    [Parameter(Mandatory=$false)][string]$proxyUrl
+ )
+
+### STEP 1: INITIALIZATION ###
+
+# https://techwizard.cloud/2021/05/12/csom-error-exception-calling-executequery-with-0-arguments-the-underlying-connection-was-closed/
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;
+
+#set MAIN variable
+$global:sitedata = @()
+$today = Get-Date
+$month = $today.Month.ToString()
+$day = $today.Day.ToString()
+$year = $today.AddYears(-2000).Year.ToString()
+if ($month.Length -eq 1){$month = "0" + $month}	
+if ($year.Length -eq 1){$year = "0" + $year}
+if ($day.Length -eq 1){$day = "0" + $day}
+$datedifferentiator = $year + $month
+$daydifferentiator = $year + $month + $day 
+
+#https://docs.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online#example-of-decorating-traffic-with-user-agent-when-using-client-side-object-model-csom
+$decorateTrafficToAvoidThrottling = "NONISV|wvstrien|SecurityAccessCheck/1.0";
+
+#Load DLL's
+Clear-Host
+$global:currentdir = (Split-Path -Parent $MyInvocation.MyCommand.Path)
+Write-host -ForegroundColor darkblue "[$(Get-Date)] - Running from location: " $global:currentdir
+Add-Type -Path $global:currentdir"\DLL\Microsoft.SharePoint.Client.dll"
+Add-Type -Path $global:currentdir"\DLL\Microsoft.SharePoint.Client.Runtime.dll"
+Add-Type -Path $global:currentdir"\DLL\Microsoft.Online.SharePoint.Client.Tenant.dll"
+
+#Import AzureAD module
+Import-Module "$env:ProgramFiles\WindowsPowerShell\Modules\AzureAD\2.0.2.50\AzureAD.psd1"
+
+#start transcript as total result log, including ALL information
+Start-Transcript -Path $global:currentdir"\Transact-Log\transactlog-$daydifferentiator.txt"
+
+#creating seperate log to follow progression and see results
+$logfilename = "$global:currentdir\log\log$datedifferentiator.txt"
+if (! (Test-Path -Path $logfilename))
+{
+    write-host "File doesn't exist. Creating logfile"
+    $newfile = New-Item -Path "$global:currentdir\log" -Name "log$daydifferentiator.txt" -ItemType "File" -Verbose
+    " -- Logfile Created --" | out-file $logfilename -Append
+}
+
+"[$today] `t Started logging" | out-file $logfilename -Append
+
+try {
+    . ("$global:currentdir\SafePassword.ps1")
+}
+catch {
+    Write-Host "Error while loading supporting PowerShell Script" 
+}
+
+
+### END OF STEP 1: INITIALIZATION ###
+
+
+### MODULES - For CSOM-based interop with SharePoint Online to retrieve Security information on level of Site Collection (and drill down to subsites + Libraries/Lists) ###
+
+$siteGroupMembers = @{};
+
+#Functions
+Function GetStackTrace() {
+    $stackTrace = $Error[0].InvocationInfo.Line;
+    $stackTrace += $Error[0].InvocationInfo.PositionMessage;
+    return "Error: $_.Exception.Message\nStacktrace: " + $stackTrace;
+}
+
+Function CreateClientContextForWeb($webUrl) {
+    $cltContext = New-Object Microsoft.SharePoint.Client.ClientContext($webUrl)
+    $cltContext.credentials = $spoCreds;
+    #Minimize risk / occurrence of 'timeout'; by increasing the RequestTimeout
+    #Inspiration: System.Threading.Timeout.Infinite; reference: https://sharepoint.stackexchange.com/questions/278657/error-exception-calling-executequery-with-0-arguments-the-operation-h
+    $cltContext.RequestTimeout = 5000*10000;  
+
+    #Decorate the webrequests, as instruction / guidance to Microsoft to skip throttling.
+    $cltContext.add_ExecutingWebRequest({
+		param($Source, $EventArgs)
+		$request = $EventArgs.WebRequestExecutor.WebRequest;
+        $request.UserAgent = $decorateTrafficToAvoidThrottling;
+	})
+    return $cltContext;
+}
+
+$global:ctxQueryObjects = @();
+
+# Inspiration via a.o. https://docs.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online;
+# and also a previous version https://www.titanwolf.org/Network/q/cf521466-7d46-4352-af2c-55e8236928b1/x
+# But retry-execution required to do different ==> in situation of "The underlying connection was closed: A connection that was expected to be kept alive was closed by the server"
+# the thrown exception does not include "wrapper = (ClientRequestWrapper)ex.Data["ClientRequest"]"
+# Therefore alternative approach; in which to capture all for Loading requested SPO entities before ExecuteQuery; and in case of needed Retry explicit ask for reload again.
+#
+# 
+# <summary>
+# Extension method to invoke execute query with retry and incremental back off.
+# </summary>
+# <param name="context"></param>
+# <param name="retryCount">Maximum amount of retries before giving up.</param>
+# <param name="delay">Initial delay in milliseconds.</param>
+Function ExecuteQueryWithIncrementalRetry($context, $retryCount, $delay) {
+    $retryAttempts = 0;
+    $backoffInterval = $delay;
+
+    # Do while retry attempt is less than retry count
+    while ($retryAttempts -lt $retryCount)
+    {
+        try
+        {
+            $context.ExecuteQuery();
+            # Successful query execution; empty the captured 'load requests' for next Load + ExecuteQuery execution
+            $global:ctxQueryObjects = @();
+            return;
+        }
+        catch 
+        {
+            $throttlingOrTimeout = $false;
+            $exception = $_.Exception;
+            $response = [System.Net.HttpWebResponse]$exception.Response;
+            if (($response -ne $null) -and ($response.StatusCode -eq 429 -or $response.StatusCode -eq 503)) {
+                $throttlingOrTimeout = $true;
+            } else {
+                $errorDetails = $exception.ToString();
+                Write-Host "     [$(Get-Date)] ExecuteQueryWithIncrementalRetry - Reported error: $errorDetails"
+                $throttlingOrTimeout = $errorDetails.Contains("The operation has timed out") -or $errorDetails.Contains("A connection that was expected to be kept alive was closed by the server");
+            }
+
+            if ($throttlingOrTimeout) {
+                Write-Host "     [$(Get-Date)] ExecuteQueryWithIncrementalRetry - CSOM request frequency exceeded usage limits. Sleeping for $backoffInterval seconds before retrying."
+                Start-Sleep -Seconds $backoffInterval;
+                $retryAttempts++;
+                $backoffInterval = $backoffInterval * 2;
+
+                # Repeat 'load-requests' for all SPO entities that were failed to load in this clientContext executeQuery.
+                # Without that; in situation of 'connection is closed'; the earlier load requests are missing from the clientContext; and on retried ExecuteQuery the requested SPO entities not loaded.
+                foreach($loadQuery in $global:ctxQueryObjects) {
+                    $load = [Microsoft.SharePoint.Client.ClientContext].GetMethod("Load");
+                    $type = $loadQuery.Object.GetType();
+                    $clientLoad = $load.MakeGenericMethod($type);
+                    $clientLoad.Invoke($context,@($loadQuery.Object, $loadQuery.ExpressionArray));
+                }
+            }
+            else
+            {
+                Write-Host "     [$(Get-Date)] ExecuteQueryWithIncrementalRetry - $response"
+                # Unsuccessful query execution, but not due throttling; empty the captured 'load requests' for next Load + ExecuteQuery execution
+                $global:ctxQueryObjects = @();
+                throw $exception;
+            }
+        }
+    }
+    # Unsuccessful query execution, and reached maximum of retry attempts; empty the captured 'load requests' for next Load + ExecuteQuery execution
+    $global:ctxQueryObjects = @();
+    throw "Maximum retry attempts $retryCount, has be attempted.";
+}
+
+Function Invoke-LoadMethod() {
+param(
+   [Microsoft.SharePoint.Client.ClientObject]$Object = $(throw "Please provide a Client Object"),
+   [string]$PropertyName
+) 
+   $ctx = $Object.Context
+   $load = [Microsoft.SharePoint.Client.ClientContext].GetMethod("Load") 
+   $type = $Object.GetType()
+   $clientLoad = $load.MakeGenericMethod($type) 
+
+
+   $Parameter = [System.Linq.Expressions.Expression]::Parameter(($type), $type.Name)
+   $Expression = [System.Linq.Expressions.Expression]::Lambda(
+            [System.Linq.Expressions.Expression]::Convert(
+                [System.Linq.Expressions.Expression]::PropertyOrField($Parameter,$PropertyName),
+                [System.Object]
+            ),
+            $($Parameter)
+   )
+   $ExpressionArray = [System.Array]::CreateInstance($Expression.GetType(), 1)
+   $ExpressionArray.SetValue($Expression, 0)
+   $clientLoad.Invoke($ctx,@($Object,$ExpressionArray))
+
+   # Capture the 'load request for SPO entity', for potential need of retry in case of throttling occurring.
+   $global:ctxQueryObjects += @{ 
+        Object = $Object
+        ExpressionArray = $ExpressionArray 
+   };  
+}
+
+Function Process-Webs($web, $webUrl, [Boolean] $isroot, $processProgressIndicator)
+{
+    if ($web) {
+        $webUrl = $web.Url;
+    }
+    "[$(Get-Date)] `t`t Process-Webs::Processing Web: $webUrl $processProgressIndicator" | out-file $logfilename -Append
+	Write-Host -ForegroundColor Green "[$(Get-Date)] -   Processing Web: $webUrl $processProgressIndicator"
+
+    if (-not $isroot) {
+        #Create new client context on this level; to prevent that client context from root level is too long in usage; and "close connection" situation occurs.
+        if ($sitecolcontext) {
+            $sitecolcontext.Dispose();
+        }
+        $sitecolcontext = CreateClientContextForWeb $webUrl
+        $web = $sitecolcontext.Web;
+        $sitecolcontext.Load($web);
+        ExecuteQueryWithIncrementalRetry $sitecolcontext 3 30
+    }
+
+	Report-SiteSecurity $web $isroot
+	#Process-ListLibraries $web
+
+    Invoke-LoadMethod -Object $web -PropertyName "Webs"
+	write-host "     [$(Get-Date)] - ExecuteQuery 'load all subwebs' for web: $($web.Url)"
+    ExecuteQueryWithIncrementalRetry $sitecolcontext 3 30
+    $allwebs = $web.Webs;
+		
+	If ($allwebs.count -gt 0 )
+	{
+        $allwebsUrls = [System.Collections.ArrayList]@();
+
+		foreach ($subweb in $allwebs)
+		{
+            # exclude the app webs
+            if ($subweb.URL -like "$global:siteUrl/*")
+			{
+                $silenceAdd = $allwebsUrls.Add($subweb.URL);
+            }
+        }
+
+        $subwebCounter = 0;
+		foreach ($subwebUrl in $allwebsUrls)
+		{	
+            $subwebCounter++;
+            $progressIndicator = "($subwebCounter of $($allwebsUrls.count) subwebs in total)";
+			Process-Webs $null $subwebUrl $false $progressIndicator;		
+		}
+	}
+}
+
+# Be Aware: current this step is NOT done. Reason is that it would severe extend on the execution of the job; of also check done on List / Libraries level.
+Function Process-ListLibraries($web)
+{
+    Invoke-LoadMethod -Object $web -PropertyName "lists"
+	write-host "       [$(Get-Date)] - ExecuteQuery 'load all lists / libraries' for web: $($web.Url)"
+    ExecuteQueryWithIncrementalRetry $sitecolcontext 3 30
+    $AllLists = $web.lists
+	
+	foreach($list in $AllLists)
+	{
+
+		if ($list.Hidden)
+		{
+		}
+		else
+		{
+			if ($list.itemcount -gt 0)
+			{
+				$list.title
+				Invoke-LoadMethod -Object $list -PropertyName "HasUniqueRoleAssignments"
+				if ($list.HasUnigueRoleAssignments)
+				{		
+					Write-Host "Specific" $list.title
+				}
+				else
+				{
+					Write-Host "Inheritance" $list.title
+				}
+			}
+		}
+	}	
+}
+
+Function Add-SiteRecord ($DataObject, $URL, $inheretance, $permission, $Title, $email, $memberof, $loginName)
+{
+	$siteRecord = New-Object -TypeName PSObject
+	$siteRecord | Add-Member -MemberType NoteProperty -Name Object -Value $DataObject
+	$siteRecord | Add-Member -MemberType NoteProperty -Name URL -Value $URL
+	$siteRecord | Add-Member -MemberType NoteProperty -Name Inheritance -Value $inheretance
+	$siteRecord | Add-Member -MemberType NoteProperty -Name Permission -Value $permission
+	$siteRecord | Add-Member -MemberType NoteProperty -Name Title -Value $Title
+	$siteRecord | Add-Member -MemberType NoteProperty -Name Email -Value $email
+	$siteRecord | Add-Member -MemberType NoteProperty -Name MemberOf -Value $memberof
+	$siteRecord | Add-Member -MemberType NoteProperty -Name LoginName -Value $loginName
+
+	$accountType = $null
+	if ($DataObject -Match "User") {
+		$accountType = "Employee account"
+        if ($loginName -and $loginName.ToLowerInvariant() -Match "#ext#@wvstrien.onmicrosoft.com") {
+            $accountType = "Guest account"
+        }	
+	}
+	$siteRecord | Add-Member -MemberType NoteProperty -Name AccountType -Value $accountType
+		
+	$global:sitedata += $siteRecord
+}
+
+#https://social.msdn.microsoft.com/Forums/en-US/78b12a0a-0457-4610-96b6-ac62ac4ee97b/getazuread-cmdlets-error-unexpected-character-encountered-while-parsing-value-t-path?forum=azurescripting 
+
+Function FaultTolerantGet_AzureADGroup ($webTitle, $grpUser)
+{
+    $groupAadObjectId = $null;
+    $groupLoginName = $grpUser.LoginName;
+    if ($groupLoginName.Contains("federateddirectoryclaimprovider|")) {
+        $groupAadObjectId = $groupLoginName.substring($groupLoginName.indexOf("federateddirectoryclaimprovider|") + "federateddirectoryclaimprovider|".Length);
+        $groupTitle = $grpUser.Title;
+        if ($groupTitle.EndsWith(" Owners")) {
+            $groupAadObjectId = $groupAadObjectId.substring(0, $groupAadObjectId.IndexOf("_"));
+        }
+    }
+
+	$GetAzureADGroupAttemptCount = 0
+	$GetAzureADGroupAttemptCountLimit = 10
+	$office365Group = $null
+    $getAzureCallSuccessful = $false
+	do {
+		try {
+			$GetAzureADGroupAttemptCount++
+            if ($groupAadObjectId) {
+                $office365Group = Get-AzureADGroup -ObjectId $groupAadObjectId;
+            } else {
+			    $office365Group = Get-AzureADGroup -SearchString $webTitle | where-object { $_.DisplayName -eq $webTitle }
+            }
+            $getAzureCallSuccessful = $true
+		} catch {
+			Start-Sleep -seconds 1
+		}
+	} until ($getAzureCallSuccessful -or $GetAzureADGroupAttemptCount -ge $GetAzureADGroupAttemptCountLimit)
+
+	return $office365Group
+}
+
+Function FaultTolerantGet_AzureADGroupUsers ($grpUser, $office365Group)
+{
+	$GetAzureADGroupUsersAttemptCount = 0
+	$GetAzureADGroupUsersAttemptCountLimit = 10
+	$office365GroupUsers = $null
+    $getAzureCallSuccessful = $false
+	do {
+		try {
+            $GetAzureADGroupUsersAttemptCount++
+            $groupTitle = $grpUser.Title;
+            if ($groupTitle.EndsWith(" Owners")) {
+				$office365GroupUsers = Get-AzureADGroupOwner -ObjectId $office365Group.ObjectId -All $true | Select DisplayName, UserPrincipalName
+			} else {
+				$office365GroupUsers = Get-AzureADGroupMember -ObjectId $office365Group.ObjectId -All $true | Select DisplayName, UserPrincipalName
+			}
+            $getAzureCallSuccessful = $true
+		} catch {
+			Start-Sleep -seconds 1
+		}
+	} until ($getAzureCallSuccessful -or $GetAzureADGroupUsersAttemptCount -ge $GetAzureADGroupUsersAttemptCountLimit)
+
+	return $office365GroupUsers
+}
+
+Function Report-SiteSecurity ($web , [Boolean] $isroot)
+{
+	write-host "   [$(Get-Date)] - Execute Report-SiteSecurity for web: $($web.Url)"
+
+	#write-host "Type,Url,Inheretance,Permission,Title,Email,MemberOf,LoginName,AccountType"
+	
+	Invoke-LoadMethod -Object $web -PropertyName "HasUniqueRoleAssignments"
+	Invoke-LoadMethod -Object $web -PropertyName "RoleAssignments"
+	Invoke-LoadMethod -Object $web -PropertyName "Title"
+    ExecuteQueryWithIncrementalRetry $sitecolcontext 3 30
+	
+	$uniquepermissions = $web.hasuniqueroleassignments
+	
+	if ($uniquepermissions)
+	{
+		#has unique permissions
+		if ($isroot)
+		{
+			Add-SiteRecord "RootSite" $web.Url $false $null $web.Title
+		}
+		else
+		{
+			Add-SiteRecord "SubSite" $web.Url $false $null $web.Title
+		}
+		
+        Invoke-LoadMethod -Object $web -PropertyName "sitegroups"
+	    write-host "     [$(Get-Date)] - ExecuteQuery 'load groups' for web: $($web.Url)"
+        ExecuteQueryWithIncrementalRetry $sitecolcontext 3 30
+        $groups = $web.sitegroups;
+
+		foreach($WebRoleAssignment in $Web.RoleAssignments ) 
+	    { 			
+			Invoke-LoadMethod -Object $WebRoleAssignment -PropertyName "RoleDefinitionBindings"
+			Invoke-LoadMethod -Object $WebRoleAssignment -PropertyName "Member"
+            
+            ExecuteQueryWithIncrementalRetry $sitecolcontext 3 30
+
+			$PrincipalType = $WebRoleAssignment.Member.PrincipalType
+			#Write-Host -ForegroundColor Green "Processing: $PrincipalType"
+
+			if ($PrincipalType -eq "User")
+			{
+				#process user info, explicit added user
+				foreach ($RoleDefinition  in $WebRoleAssignment.RoleDefinitionBindings)
+			   	{
+					Add-SiteRecord "User" $web.URL $null $RoleDefinition.Name $WebRoleAssignment.Member.Title $WebRoleAssignment.Member.email $null $WebRoleAssignment.Member.LoginName
+	           	}
+				
+			}
+			elseif ($PrincipalType -eq "SharePointGroup")
+			{
+				#process this SharePoint group, explicit added SharePoint group
+				foreach ($RoleDefinition  in $WebRoleAssignment.RoleDefinitionBindings)
+			   	{
+					#get group for more info
+					Add-SiteRecord "SharePoint Group" $web.URL $null $RoleDefinition.Name $WebRoleAssignment.Member.Title $null $WebRoleAssignment.Member.email
+					
+					$isGroupCached = $global:siteGroupMembers.ContainsKey($WebRoleAssignment.Member.Title)
+
+                    if($isGroupCached -eq $false){
+                        Invoke-LoadMethod -Object $groups.GetByName($WebRoleAssignment.Member.LoginName) -PropertyName "Users"
+	                    write-host "     [$(Get-Date)] - ExecuteQuery 'load group users' for group: $($WebRoleAssignment.Member.LoginName)"
+                        ExecuteQueryWithIncrementalRetry $sitecolcontext 3 30
+                        $groupUsers = $groups.GetByName($WebRoleAssignment.Member.LoginName).Users;
+
+                        $userRecordSum = @()
+                        $o365GroupUserRecordSum = @()
+
+					    foreach($grpUser in $groupUsers)
+					    {
+						    if ($grpUser.loginname -ne "SHAREPOINT\system")
+						    {
+							    if ($web.Title.Trim().length -gt 0 -and $grpUser.Title.Contains($web.Title)) {
+									$isO365GroupCached = $global:siteGroupMembers.ContainsKey($grpUser.Title)
+									if ($isO365GroupCached -eq $false) {
+										$office365Group = FaultTolerantGet_AzureADGroup $web.Title $grpUser
+										if ($office365Group) {
+											$office365GroupUsers = FaultTolerantGet_AzureADGroupUsers $grpUser $office365Group
+											if ($office365GroupUsers) {
+												foreach($office365GrpUser in $office365GroupUsers) {
+														Add-SiteRecord "Office 365 Group User" $web.URL $null $RoleDefinition.Name $office365GrpUser.DisplayName $office365GrpUser.UserPrincipalName ("O365 Group: " + $grpUser.Title) $office365GrpUser.UserPrincipalName
+														$o365GroupUserRecordSum += $office365GrpUser
+													
+												}
+                      }
+
+											if(!$global:siteGroupMembers.ContainsKey($grpUser.Title)){
+												$global:siteGroupMembers.Add($grpUser.Title, $o365GroupUserRecordSum);
+											}
+										}
+									} else {
+										$office365GroupMembers = $global:siteGroupMembers.Item($grpUser.Title);
+										foreach($office365GrpUser in $office365GroupMembers){
+											Add-SiteRecord "Office 365 Group User" $web.URL $null $RoleDefinition.Name $office365GrpUser.DisplayName $office365GrpUser.UserPrincipalName ("O365 Group: " + $grpUser.Title) $office365GrpUser.UserPrincipalName
+										}
+									}
+								} else {
+									Add-SiteRecord "SharePoint Group User" $web.URL $null $RoleDefinition.Name $grpUser.Title $grpUser.Email ("SharePoint Group: " + $WebRoleAssignment.Member.LoginName) $grpUser.loginname
+								}
+
+								$userRecordSum += $grpUser
+						    }
+					    }
+
+                        if(!$global:siteGroupMembers.ContainsKey($WebRoleAssignment.Member.Title)){
+                            $global:siteGroupMembers.Add($WebRoleAssignment.Member.Title, $userRecordSum);
+                        }
+                        
+                    }else{
+                        $groupMembers = $global:siteGroupMembers.Item($WebRoleAssignment.Member.Title);
+                        foreach($grpMember in $groupMembers){
+							if ($grpMember.Title -and $web.Title.Trim().length -gt 0 -and $grpMember.Title.Contains($web.Title)) {
+								$office365GroupMembers = $global:siteGroupMembers.Item($grpMember.Title);
+								foreach($office365GrpUser in $office365GroupMembers){
+									Add-SiteRecord "Office 365 Group User" $web.URL $null $RoleDefinition.Name $office365GrpUser.DisplayName $office365GrpUser.UserPrincipalName ("O365 Group: " + $grpMember.Title) $office365GrpUser.UserPrincipalName
+								}		
+							} else {
+								Add-SiteRecord "SharePoint Group User" $web.URL $null $RoleDefinition.Name $grpMember.Title $grpMember.Email ("SharePoint Group: " + $WebRoleAssignment.Member.LoginName) $grpMember.loginname
+							}
+                        }
+                    }
+	           	}
+			}
+			elseif ($PrincipalType -eq "SecurityGroup")
+			{
+				foreach ($RoleDefinition  in $WebRoleAssignment.RoleDefinitionBindings)
+			   	{
+					#get user for more info
+					Add-SiteRecord "Security Group" $web.URL $null $RoleDefinition.Name $WebRoleAssignment.Member.Title $WebRoleAssignment.Member.email $null $WebRoleAssignment.Member.LoginName
+	           	}
+			}
+			else{write-host "Not yet Implemented"}
+		}
+		
+	}
+	else
+	{
+		#Write-Host "-- Inherited permissions"
+		#Permission inherited
+		if ($isroot)
+		{
+			Add-SiteRecord "RootSite" $web.URL $true $web.Title
+			
+		}
+		else
+		{
+			Add-SiteRecord "SubSite" $web.URL $true $web.Title
+		}
+	}
+}
+
+Function Process-SiteCollection($siteurl, $spoCreds, $siteProcessState){
+    
+    $global:siteUrl = $siteurl
+
+    $processingTime = Get-Date
+    "[$processingTime] `t Processing Site Collection: $siteUrl" | out-file $logfilename -Append
+	Write-Host -ForegroundColor Green "[$processingTime] - Process-SiteCollection::Processing: $siteurl"
+
+    try{
+	    #moving to csom to get more info (extending possibilites)
+    
+        $sitecolcontext = CreateClientContextForWeb $siteurl
+   
+	    $rootweb = $sitecolcontext.Web
+	    $sitecolcontext.Load($rootweb)
+        Invoke-LoadMethod -Object $rootweb -PropertyName "AllProperties"
+        ExecuteQueryWithIncrementalRetry $sitecolcontext 3 30
+	    $allProperties = $rootweb.AllProperties
+
+	    #check whether the SharePoint site concerns a Collaboration Site.
+		if ($allProperties["InformationClassification"] -ne $null) {
+
+			#clean global Variable for each site collection					
+			$global:sitedata = @()
+			$global:siteGroupMembers = @{};
+
+            # Execute the full processing, of the full site collection; with potential a nested subwebs hierarchy.
+            # This is the main 'engine' of this job.
+			Write-Host "[$(Get-Date)] - Process the security report for all webs in site: $siteurl"
+			Process-Webs $rootweb $rootweb.URL $true ""
+			Write-Host "[$(Get-Date)] - Finished processing of security report for all webs in site: $siteurl"
+
+            # Upload the results to the inspected site.
+            #renew client context; as it may have been expired in case of longer processing during 'Process-Webs' engine execution.
+            $sitecolcontext = CreateClientContextForWeb $siteurl
+    	    $rootweb = $sitecolcontext.Web
+	        $sitecolcontext.Load($rootweb)
+            ExecuteQueryWithIncrementalRetry $sitecolcontext 3 30
+
+			$sitePath = $rootweb.ServerRelativeUrl;
+			$sitePath = $sitePath.Remove(0,$sitePath.LastIndexOf("/")+1)
+
+			$fName = $global:currentdir + "\Temp\" + $sitePath + "-$datedifferentiator-automatedsecreport.csv"
+			Write-Host "Generate file $fName"
+			$global:sitedata | Export-Csv -Path $fName -NoTypeInformation
+					
+			#needed to prevent opening file in progress
+			Start-Sleep -s 2
+
+			#check if 'SecurityOverviewforSiteOwner' list exists, If not, create it
+			$secListTitle = "SecurityOverviewforSiteOwner";
+			$seclist = $rootweb.Lists.GetByTitle($secListTitle)
+			$sitecolcontext.Load($seclist)
+			try
+			{
+				$sitecolcontext.ExecuteQuery()
+			}
+			catch
+			{
+				Write-Host "'SecurityOverviewforSiteOwner' List not present. Needs Creation"
+
+				$listinfo =New-Object Microsoft.SharePoint.Client.ListCreationInformation
+				$listinfo.Title = $secListTitle
+				$listinfo.TemplateType = [Microsoft.SharePoint.Client.ListTemplateType]'DocumentLibrary'
+				$listinfo.QuickLaunchOption = 0
+				$seclist = $rootweb.Lists.Add($listinfo)
+				$sitecolcontext.ExecuteQuery()
+		
+				#get site group
+				$siteGroup = $rootweb.AssociatedOwnerGroup
+				$sitecolcontext.Load($siteGroup)
+				$sitecolcontext.ExecuteQuery()
+						
+				#break inheritance and do not copy the roles
+
+                $allroleDefinition = $rootweb.RoleDefinitions
+                $sitecolcontext.Load($allroleDefinition)
+				$sitecolcontext.ExecuteQuery()
+
+				$seclist.BreakRoleInheritance($False,$true)
+				#declare new role read for site owners on library
+				$roleName = "Read"
+				$roleAssignment = new-object Microsoft.SharePoint.Client.RoleDefinitionBindingCollection($sitecolcontext)	
+				$roleDefinition=$allroleDefinition.GetByName($roleName)
+				$sitecolcontext.Load($roleDefinition)
+				$sitecolcontext.ExecuteQuery()
+						
+				$roleAssignment.Add($roleDefinition)
+				$collRoleAssign = $seclist.RoleAssignments
+						
+				$sitecolcontext.Load($collRoleAssign.Add($siteGroup, $roleAssignment))
+				$seclist.Update()
+				$sitecolcontext.ExecuteQuery()	
+
+				Write-Host "List created"
+
+			    #remove list from recent in quick launch
+				write-host "Checking quick launch"
+				$ql = $rootweb.Navigation.QuickLaunch
+				$sitecolcontext.load($ql)
+				$sitecolcontext.ExecuteQuery()
+				foreach($node in $ql)
+				{
+					if ($node.Title -eq "Recent")
+					{
+						$sitecolcontext.load($node)
+						$sitecolcontext.ExecuteQuery()
+						$children = $node.Children
+						$sitecolcontext.load($children)
+						$sitecolcontext.ExecuteQuery()
+						foreach($n in $children)
+						{
+							if ($n.Title -eq "SecurityOverviewforSiteOwner")
+							{
+								$n.DeleteObject()
+								$sitecolcontext.ExecuteQuery()
+								break
+							}
+						}
+					}
+				}
+			}
+
+
+			#upload local file
+			Write-Host "Upload file $fName"
+			$FileStream = New-Object IO.FileStream($fName,[System.IO.FileMode]::Open)
+			$FileCreationInfo = New-Object Microsoft.SharePoint.Client.FileCreationInformation
+			$FileCreationInfo.Overwrite = $true
+			$FileCreationInfo.ContentStream = $FileStream
+			$FileCreationInfo.URL = "AutomatedMonthlySecurityReport-$datedifferentiator.csv"
+			$Upload = $seclist.RootFolder.Files.Add($FileCreationInfo)
+			$sitecolcontext.Load($Upload)
+			$sitecolcontext.ExecuteQuery()
+					
+			Start-Sleep -s 2
+			Write-Host "Remove file $fName"
+			Remove-Item $fName
+
+
+            if ($siteProcessState) {
+                $siteProcessState.ProcessingState = "Processed"
+                $siteProcessState.CollaberationSite = "Yes";
+                $siteProcessState.ErrorDetails = "";
+            }
+			Write-Host -ForegroundColor Green "Processed"
+		}else{
+            if ($siteProcessState) {
+                $siteProcessState.ProcessingState = "Skipped";
+                $siteProcessState.CollaberationSite = "No";
+                $siteProcessState.ErrorDetails = "";
+            }
+			Write-Host -ForegroundColor Red "Skipped: $siteurl - Not a Collaboration Site"
+		}
+
+    }catch{
+        Write-Host -ForegroundColor Red "[$(Get-Date)] - Skipped: $siteurl - Site failed to load"
+        $exception = $_.Exception;
+        $errorDetails = $exception.ToString()
+        $callStack = GetStackTrace;
+		Write-Host $errorDetails
+        Write-Host "CallStack: $callStack" -BackgroundColor DarkYellow;
+        if ($siteProcessState) {
+            if ($errorDetails.Contains("(401) Unauthorized")) {
+                $siteProcessState.ProcessingState = "NoAccess"
+                $siteProcessState.ErrorDetails = "(401) Unauthorized";
+            }
+            if ($errorDetails.Contains("Access denied. You do not have permission")) {
+                $siteProcessState.ProcessingState = "NoAccess"
+                $siteProcessState.ErrorDetails = "No Permission";
+            }
+            if ($errorDetails.Contains("(429)")) {
+                $siteProcessState.ErrorDetails = "(429) Throttling";
+            }
+        }
+
+        #https://stackoverflow.com/questions/50437795/cross-edition-exception-handling-with-powershell-web-cmdlets ==> "Unable to find type [Microsoft.PowerShell.Commands.HttpResponseException]."
+        if ($exception.GetType().FullName.Contains("HttpResponseException")) {
+            Write-Host "CATCHED HttpResponseException";
+            [int] $delay = [int](($exception.Response.Headers | Where-Object Key -eq 'Retry-After').Value[0])
+            Write-Host "CATCHED retry-after: $delay";
+        }
+        if ($exception.GetType().FullName.Contains("WebException")) {
+            Write-Host "CATCHED WebException";
+        }
+
+        if ($siteProcessState) {
+            if ($exception.Response.GetType().FullName.Contains("HttpWebResponse")) {
+                $response = [System.Net.HttpWebResponse]$exception.Response;
+                if (($response -ne $null) -and ($response.StatusCode -eq 429 -or $response.StatusCode -eq 503)) {
+                    $siteProcessState.RetryAfter = $response.Headers["Retry-After"];
+                }
+            }
+        }
+    }
+
+    $sitecolcontext.Dispose();					
+}
+
+### End of MODULES - For CSOM-based interop with SharePoint Online to retrieve Security information on level of Site Collection (and drill down to subsites + Libraries/Lists) ###
+
+### MODULES - Powershell handling ###
+
+function Get-LastOperationalState() {
+    if (! (Test-Path -Path "$global:currentdir\ProcessLog")) {
+	    New-Item -ItemType directory -Path "$global:currentdir\ProcessLog"
+    }
+	return "$global:currentdir\ProcessLog\OperationalState.csv";
+}
+
+### End of MODULES - Powershell handling ###
+
+### Main Routine: Controller of execution ###
+
+#SPO Client Object Model Context  
+$spoCreds = GetCredentials "SPO";
+$proxCred = GetCredentials "PROXY";
+$aadCred = GetCredentials "AAD";
+
+$myCredentialCache = New-Object System.Net.CredentialCache
+$myCredentialCache.Add($proxyUrl, "Basic", $proxCred);
+$ServerProxy =  New-Object System.Net.WebProxy($proxyURL);
+$ServerProxy.Address = New-Object Uri($proxyURL);
+$ServerProxy.Credentials = $myCredentialCache
+$ServerProxy.BypassProxyOnLocal = $true;
+
+[System.Net.WebRequest]::DefaultWebProxy = $ServerProxy;
+
+Connect-AzureAD -Credential $aadCred
+
+
+if($tenantUrl){ 
+    ## Step i: Retrieve all spoSiteCollections to process
+    ## Mode 'New': all in tenant
+    ## Mode 'Continue': pick where left last time, in interrupted execution
+
+    $spoSiteCollectionsToProcess = [ordered]@{}
+
+    if ($processingMode -eq "Full") {
+        $spoCtx = New-Object Microsoft.SharePoint.Client.ClientContext($tenantUrl)  
+        $spoCtx.Credentials = $spoCreds 
+        $spoTenant= New-Object Microsoft.Online.SharePoint.TenantAdministration.Tenant($spoCtx) 
+
+        $nextIndex = 0;
+
+        DO{
+	        # Limitation of 'GetSiteProperties' is that it does not include Modern Sites (http://www.ktskumar.com/2018/05/get-site-collections-sharepoint-online-tenant/)
+		    # Use 'GetSitePropertiesFromSharePoint' in combination with 'NextStartIndexFromSharePoint' instead
+            $spoTenantSiteCollections=$spoTenant.GetSitePropertiesFromSharePoint($nextIndex, $true)        
+
+            $spoCtx.Load($spoTenantSiteCollections) 
+            $spoCtx.ExecuteQuery() 
+
+            Write-Host "[$(Get-Date)] - Determine site collections; retrieved next batch; total until now: "$spoSiteCollectionsToProcess.Count
+
+            #We need to iterate through the $spoTenantSiteCollections object to get the information of each individual Site Collection 
+            foreach($spoSiteCollection in $spoTenantSiteCollections)
+	        { 
+			    $siteUrl = $spoSiteCollection.Url;
+                $siteProcessState = new-object psobject	
+                $siteProcessState | add-member noteproperty -name "Url" -value $siteUrl
+                $siteProcessState | add-member noteproperty -name "ProcessingState" -value "NotProcessed"
+                $siteProcessState | add-member noteproperty -name "CollaberationSite" -value "NotDetermined"
+                $siteProcessState | add-member noteproperty -name "ErrorDetails" -value ""  
+                $siteProcessState | add-member noteproperty -name "RetryAfter" -value ""  
+                $spoSiteCollectionsToProcess.Add($siteUrl,$siteProcessState);
+            }
+
+            $nextIndex = $spoTenantSiteCollections.NextStartIndexFromSharePoint;
+
+        }While($nextIndex -ne $null -and $nextIndex -gt 0)	
+
+        $spoCtx.Dispose()
+    
+        $lastOperationStateFile = Get-LastOperationalState
+        $spoSiteCollectionsToProcess.Values |  Export-Csv $lastOperationStateFile -NoTypeInformation
+
+        $fullInitialOperationFile = "$global:currentdir\ProcessLog\OperationalState-$daydifferentiator.csv";
+        $spoSiteCollectionsToProcess.Values |  Export-Csv $fullInitialOperationFile -NoTypeInformation
+    }
+    else {
+        $lastOperationStateFile = Get-LastOperationalState
+        if ($lastOperationStateFile -ne "" -and (Test-Path -Path $lastOperationStateFile)) {
+		    $lastOperationState = Import-Csv $lastOperationStateFile
+
+		    ForEach ($operationState in $lastOperationState){				
+			    $spoSiteCollectionsToProcess.Add($operationState.Url, $operationState)
+		    }
+        }
+    }
+
+
+    ## Step ii: Process the retrieved spoSiteCollections
+
+ 	ForEach ($spoSiteCltn in $spoSiteCollectionsToProcess.Keys) {
+        $siteProcessState = $spoSiteCollectionsToProcess[$spoSiteCltn];
+        if ($siteProcessState.ProcessingState -eq "NotProcessed" -or $siteProcessState.ErrorDetails.StartsWith("(429)")) {
+			$siteUrl = $siteProcessState.Url   
+            $retryAttemps = 3;
+            Do{
+                Process-SiteCollection $siteUrl $spoCreds $siteProcessState
+                $spoSiteCollectionsToProcess.Values |  Export-Csv $lastOperationStateFile -NoTypeInformation
+                if ($siteProcessState.errordetails.StartsWith("(429)")) {
+                   $retryAfter = 0
+                    if ($siteProcessState.RetryAfter -ne "") {
+                        $processingTime = Get-Date
+                        "[$processingTime] `t Throttling occurred, specified retry after: $siteProcessState.RetryAfter" | out-file $logfilename -Append
+                        $retryAfter = $siteProcessState.RetryAfter -as [int]
+
+                    }
+                    if ($retryAfter -eq 0) {
+                        $retryAfter = 600;
+                    }
+                    "[$(Get-Date)] `t Throttling occurred, wait $retryAfter seconds: $siteUrl" | out-file $logfilename -Append
+                    # Wait 5 minutes
+                    Start-Sleep -Seconds $retryAfter
+                }
+                $retryAttemps--;
+            }While($siteProcessState.ProcessingState -eq "NotProcessed" -and $retryAttemps -gt 0)	       
+        }
+    }
+
+    $lastOperationStateFile = Get-LastOperationalState
+    $spoSiteCollectionsToProcess.Values |  Export-Csv $lastOperationStateFile -NoTypeInformation
+
+}elseif($siteUrl){
+    Process-SiteCollection $siteUrl $spoCreds $null;
+}
+
+Stop-Transcript
