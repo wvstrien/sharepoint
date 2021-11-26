@@ -438,7 +438,8 @@ Function Report-SiteSecurity ($web , [Boolean] $isroot)
 					#get group for more info
 					Add-SiteRecord "SharePoint Group" $web.URL $null $RoleDefinition.Name $WebRoleAssignment.Member.Title $null $WebRoleAssignment.Member.email
 					
-					$isGroupCached = $global:siteGroupMembers.ContainsKey($WebRoleAssignment.Member.Title)
+                    			$spGroupCacheKey = "$($WebRoleAssignment.Member.Title)|SharePointGroup";
+					$isGroupCached = $global:siteGroupMembers.ContainsKey($spGroupCacheKey)					
 
                     if($isGroupCached -eq $false){
                         Invoke-LoadMethod -Object $groups.GetByName($WebRoleAssignment.Member.LoginName) -PropertyName "Users"
@@ -454,7 +455,8 @@ Function Report-SiteSecurity ($web , [Boolean] $isroot)
 						    if ($grpUser.loginname -ne "SHAREPOINT\system")
 						    {
 							    if ($web.Title.Trim().length -gt 0 -and $grpUser.Title.Contains($web.Title)) {
-									$isO365GroupCached = $global:siteGroupMembers.ContainsKey($grpUser.Title)
+                                                                        $office365GroupCacheKey = "$($grpUser.Title)|Office365Group"
+									$isO365GroupCached = $global:siteGroupMembers.ContainsKey($office365GroupCacheKey)
 									if ($isO365GroupCached -eq $false) {
 										$office365Group = FaultTolerantGet_AzureADGroup $web.Title $grpUser
 										if ($office365Group) {
@@ -467,12 +469,12 @@ Function Report-SiteSecurity ($web , [Boolean] $isroot)
 												}
                       }
 
-											if(!$global:siteGroupMembers.ContainsKey($grpUser.Title)){
-												$global:siteGroupMembers.Add($grpUser.Title, $o365GroupUserRecordSum);
+											if(!$global:siteGroupMembers.ContainsKey($office365GroupCacheKey)){
+												$global:siteGroupMembers.Add($office365GroupCacheKey, $o365GroupUserRecordSum);
 											}
 										}
 									} else {
-										$office365GroupMembers = $global:siteGroupMembers.Item($grpUser.Title);
+										$office365GroupMembers = $global:siteGroupMembers.Item($office365GroupCacheKey);
 										foreach($office365GrpUser in $office365GroupMembers){
 											Add-SiteRecord "Office 365 Group User" $web.URL $null $RoleDefinition.Name $office365GrpUser.DisplayName $office365GrpUser.UserPrincipalName ("O365 Group: " + $grpUser.Title) $office365GrpUser.UserPrincipalName
 										}
@@ -485,15 +487,16 @@ Function Report-SiteSecurity ($web , [Boolean] $isroot)
 						    }
 					    }
 
-                        if(!$global:siteGroupMembers.ContainsKey($WebRoleAssignment.Member.Title)){
-                            $global:siteGroupMembers.Add($WebRoleAssignment.Member.Title, $userRecordSum);
+                        if(!$global:siteGroupMembers.ContainsKey($spGroupCacheKey)){
+                            $global:siteGroupMembers.Add($spGroupCacheKey, $userRecordSum);
                         }
                         
                     }else{
-                        $groupMembers = $global:siteGroupMembers.Item($WebRoleAssignment.Member.Title);
+                        $groupMembers = $global:siteGroupMembers.Item($spGroupCacheKey);
                         foreach($grpMember in $groupMembers){
 							if ($grpMember.Title -and $web.Title.Trim().length -gt 0 -and $grpMember.Title.Contains($web.Title)) {
-								$office365GroupMembers = $global:siteGroupMembers.Item($grpMember.Title);
+                                				$office365GroupCacheKey = "$($grpMember.Title)|Office365Group"
+								$office365GroupMembers = $global:siteGroupMembers.Item($office365GroupCacheKey);
 								foreach($office365GrpUser in $office365GroupMembers){
 									Add-SiteRecord "Office 365 Group User" $web.URL $null $RoleDefinition.Name $office365GrpUser.DisplayName $office365GrpUser.UserPrincipalName ("O365 Group: " + $grpMember.Title) $office365GrpUser.UserPrincipalName
 								}		
@@ -719,7 +722,7 @@ Function Process-SiteCollection($siteurl, $spoCreds, $siteProcessState){
         }
 
         if ($siteProcessState) {
-            if ($exception.Response.GetType().FullName.Contains("HttpWebResponse")) {
+            if ($exception -and $exception.Response -and $exception.Response.GetType().FullName.Contains("HttpWebResponse")) {
                 $response = [System.Net.HttpWebResponse]$exception.Response;
                 if (($response -ne $null) -and ($response.StatusCode -eq 429 -or $response.StatusCode -eq 503)) {
                     $siteProcessState.RetryAfter = $response.Headers["Retry-After"];
