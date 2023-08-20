@@ -1,0 +1,87 @@
+<script type="text/javascript">
+    var timerSet = null;
+
+    var expandAllTruncatedDivs = function(){
+          var parentDocument = window.parent.document;
+          var divTruncatedRichTextFields = parentDocument.getElementsByClassName("od-TextFieldRenderer");
+          var i;
+          for (i = 0; i < divTruncatedRichTextFields.length; i++) {
+              divTruncatedRichTextFields[i].style.overflow = "visible";
+          }
+
+          var expandIcons = parentDocument.getElementsByClassName("od-TextFieldRenderer-showIcon");
+          for (i = 0; i < expandIcons.length; i++) {
+              expandIcons[i].style.display = "none";
+          }             
+
+          var divViewports = parentDocument.getElementsByClassName("ms-Viewport");
+          for (i = 0; i < divViewports.length; i++) {
+              var up = true;
+              var parentElem = divViewports[i].parentElement;
+              while (up) {
+                  if (parentElem.style.maxHeight != "none") {
+                      parentElem.style.maxHeight = "none";
+                  }
+
+                  var parentElem = parentElem.parentElement;
+                  if (parentElem) {
+                      var dataAutomationIdAttr = parentElem.getAttribute("data-automation-id");
+                      up = (!dataAutomationIdAttr || dataAutomationIdAttr != "detailsListContainer" );
+                  } else {
+                      up = false;
+                  }
+              }
+          }
+
+          var pageCanvasContent = parentDocument.getElementById("spPageCanvasContent");
+          up = true;
+          var parentElem = pageCanvasContent.parentElement;
+          while (up) {
+              var parentElem = parentElem.parentElement;
+              if (parentElem) {                             
+                  var dataIsScrollableAttr = parentElem.getAttribute("data-is-scrollable");
+                  up = (!dataIsScrollableAttr);
+                  if (dataIsScrollableAttr) {
+                      parentElem.style.overflowX = "auto"
+                  }
+              } else {
+                  up = false;
+              }
+          }
+
+          var divListPages = parentDocument.getElementsByClassName("ms-List");
+          for (i = 0; i < divListPages.length; i++) {
+              pageCanvasContent.style.width = (divListPages[i].offsetWidth + 20) + "px";
+          }
+    };
+
+    var expandPageContentDisplay = function(){
+          var parentDocument = window.parent.document;
+          var divControlZones = parentDocument.getElementsByClassName("ControlZone");
+
+          for (i = 0; i <  divControlZones.length; i++) {
+              var up = true;
+              var parentElem = divControlZones[i].parentElement;
+              while (up) {
+                  if (parentElem.style.maxWidth != "none") {
+                      parentElem.style.maxWidth = "none";
+                  }
+
+                  var parentElem = parentElem.parentElement;
+                  up = parentElem.className != "CanvasComponent"
+              }
+          }
+
+          timerSet = setInterval(expandAllTruncatedDivs, 3000);
+    };         
+
+    var parentDocument = window.parent.document;
+    if (
+        parentDocument.readyState === "complete" ||
+        (parentDocument.readyState !== "loading" && !parentDocument.documentElement.doScroll)
+    ) {
+        expandPageContentDisplay();
+    } else {
+        parentDocument.addEventListener("DOMContentLoaded", function() { expandPageContentDisplay(); } );
+    }    
+</script>
